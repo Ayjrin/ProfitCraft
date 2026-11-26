@@ -8,6 +8,19 @@ ns.DEFAULTS = {
     minProfit = 100,  -- copper profit per craft a craft needs before it can glow (1 silver)
     ahCut = 5,        -- % of the sale price the auction house keeps
     crafts = 1,       -- Profit tab: crafts of each when building a shopping list
+
+    -- Plays tab: buying, posting and disenchanting (Options > AddOns > ProfitCraft > Buying & selling)
+    dryRun = true,        -- buttons say what they would do and spend nothing; turn off to trade for real
+    reservePct = 15,      -- % of your gold never spent (deposits, repairs, postage)
+    sessionCap = 500000,  -- copper ProfitCraft may spend per session (50 gold); 0 = only the reserve limits it
+    risk = "safe",        -- which plays are offered: "safe", "balanced" or "aggressive"
+    confidence = 95,      -- % chance a disenchant batch must have of not losing money (sets the batch size)
+    deMargin = 10,        -- % profit a green must promise over its price before it's bought to disenchant
+    salvagerBonus = 0,    -- % extra dust and essences assumed with the Arcane Salvager until it's measured
+    maxBatch = 200,       -- most items bought for one disenchant play (one Arcane Salvager lasts about 200)
+    duration = 3,         -- auction length when posting: 1, 2 or 3 (the AH's short, medium, long)
+    wheel = false,        -- scroll-down over ProfitCraft's step buttons presses them (zoom works everywhere else)
+    deAny = false,        -- the disenchant button also takes unbound greens ProfitCraft didn't buy
 }
 
 -- Fraction of the sale the auction house keeps.
@@ -39,6 +52,7 @@ local pendingErrors = {} -- errors raised before saved variables load
 local announced = {}
 
 local function Now() return (time and time()) or (os and os.time and os.time()) or 0 end
+ns.Now = Now
 
 function ns.ReportError(where, err, stack)
     err = tostring(err)
@@ -122,6 +136,9 @@ ns.On("ADDON_LOADED", function(_, name)
     wipe(pendingErrors)
     while #db.errors > MAX_ERRORS do table.remove(db.errors) end
     db.diag = db.diag or {}       -- last thing each window did, for troubleshooting from the file
+    db.telemetry = db.telemetry or {} -- what your disenchants actually gave (see Telemetry.lua)
+    db.ledger = db.ledger or {}       -- what ProfitCraft bought, posted and sold (see Ledger.lua)
+    db.clock = db.clock or {}         -- prices by weekday and time of day (see Clock.lua)
     db.settings = db.settings or {}
     for key, value in pairs(ns.DEFAULTS) do
         if db.settings[key] == nil then db.settings[key] = value end
@@ -132,6 +149,10 @@ ns.On("ADDON_LOADED", function(_, name)
     local char = ProfitCraftCharDB
     char.known = char.known or {} -- [professionID] = { [recipeID] = true }
     char.profs = char.profs or {} -- [professionID] = { name, rank, max }
+    char.deQueue = char.deQueue or {}   -- [itemID] = how many ProfitCraft bought to disenchant
+    char.salvager = char.salvager or {} -- [itemID] = true when they were bought for an Arcane Salvager run
+    char.toSell = char.toSell or {}     -- [itemID] = true for things a play will post (mats, products)
+    char.convert = char.convert or {}   -- [fromItemID] = essence conversions still to do
 
     ns.db, ns.char = db, char
 end)
@@ -164,11 +185,18 @@ end
 
 function ns.HasAuctionator() return API() ~= nil end
 
-function ns.AHPrice(itemID)
+-- Auctionator's last-scanned lowest price.
+function ns.AuctionatorPrice(itemID)
     local api = API()
     if not api or not itemID or not api.GetAuctionPriceByItemID then return nil end
     local ok, price = pcall(api.GetAuctionPriceByItemID, ADDON, itemID)
     if ok and type(price) == "number" and price > 0 then return price end
+end
+
+-- Price of one on the AH: a live search from this session, else Auctionator, else TSM (see Prices.lua).
+function ns.AHPrice(itemID)
+    if ns.Prices then return (ns.Prices.Get(itemID)) end
+    return ns.AuctionatorPrice(itemID)
 end
 
 function ns.AHAge(itemID)

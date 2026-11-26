@@ -1,0 +1,4 @@
+<Bindings>
+	<Binding name="CLICK ProfitCraftAHKey:LeftButton" header="PROFITCRAFT" category="ADDONS"/>
+	<Binding name="CLICK ProfitCraftWorkKey:LeftButton" category="ADDONS"/>
+</Bindings>

@@ -18,7 +18,8 @@ local timers = {}
 C_Timer = { After = function(_, fn) timers[#timers + 1] = fn end }
 local function flush() for _ = 1, 20 do local t = timers; timers = {}; if #t == 0 then return end; for _, f in ipairs(t) do f() end end end
 
-function GetTime() return 100 end
+local clock = 100 -- advanced by the trading tests
+function GetTime() return clock end
 function wipe(t) for k in pairs(t) do t[k] = nil end return t end
 function hooksecurefunc(a, b, c)
     if type(a) == "table" then local orig = a[b]; a[b] = function(...) local r = orig(...); c(...); return r end
@@ -38,6 +39,9 @@ function Region:IsShown() return self.shown end
 function Region:IsVisible() return self.shown end
 function Region:SetShown(v) if v then self:Show() else self:Hide() end end
 function Region:GetFrameLevel() return 1 end
+function Region:GetName() return self.name end
+function Region:SetAttribute(k, v) self.attrs = self.attrs or {}; self.attrs[k] = v end
+function Region:GetAttribute(k) return self.attrs and self.attrs[k] end
 function Region:GetHeight() return self.height or 0 end
 function Region:CreateTexture() return setmetatable({ scripts = {} }, Region) end
 function Region:CreateFontString() return setmetatable({ scripts = {} }, Region) end
@@ -57,7 +61,7 @@ function Region:CreateAnimationGroup()
     return ag
 end
 local function NewRegion(kind) local r = setmetatable({ scripts = {}, shown = true }, Region); if kind == "CheckButton" then r.isCheck = true; r.checked = false end; return r end
-function CreateFrame(kind) return NewRegion(kind) end
+function CreateFrame(kind, name) local r = NewRegion(kind); if name then r.name = name; _G[name] = r end; return r end
 local function Fire(event, ...) for _, f in ipairs(eventFrames[event] or {}) do f.scripts.OnEvent(f, event, ...) end; flush() end
 
 -- items & prices (copper)
@@ -518,6 +522,581 @@ ns.Engine:Invalidate(); flush()
 check(ns.Engine:Evaluate(300).de == nil and ns.Engine:Evaluate(300).outlet == "sell", "Enchanting gone: no disenchant values")
 check(not panel.headers.de.shown, "Enchanting gone: Disenchant column hidden")
 check(#ns.db.errors == 0, "no errors recorded in the disenchant tests")
+
+
+---------------------------------------------------------------------------
+-- 2.0: live prices, plays, buying, posting, disenchanting, the Work button
+---------------------------------------------------------------------------
+-- Every hardware-event or protected call is recorded. Any made outside a simulated press is a violation:
+-- the addon must never buy, post, cast or take mail from an event, a timer or a loop.
+local hw, restricted, violations = false, {}, 0
+local function Restricted(name, ...)
+    restricted[#restricted + 1] = { name = name, args = { ... } }
+    if not hw then violations = violations + 1; print("VIOLATION: " .. name .. " called outside a press") end
+end
+local function Press(fn, ...) hw = true; local ok, err = pcall(fn, ...); hw = false; if not ok then error(err, 2) end end
+local function Calls(name) local n = 0; for _, c in ipairs(restricted) do if c.name == name then n = n + 1 end end; return n end
+local function LastArgs(name) for i = #restricted, 1, -1 do if restricted[i].name == name then return restricted[i].args end end end
+
+function Region:GetFontString() return self.font end
+function Region:SetEnabled(v) self.enabled = v end
+date = os.date
+Enum.AuctionHouseSortOrder = { Price = 0 }
+Enum.AuctionHouseFilter = { UncommonQuality = 8, RareQuality = 9 }
+
+-- money, bags, combat, auras, bindings, spells, loot, mail
+local money = 1000000 -- 100 gold
+function GetMoney() return money end
+local bags = {}
+local function BagClear() for b = 0, 4 do bags[b] = {} end end
+BagClear()
+local function BagPut(id, count, extra)
+    for b = 0, 4 do for slot = 1, 16 do
+        if not bags[b][slot] then bags[b][slot] = { id = id, count = count, q = extra and extra.q, bound = extra and extra.bound }; return b, slot end
+    end end
+end
+local function BagCount(id) local n = 0; for b = 0, 4 do for _, it in pairs(bags[b]) do if it.id == id then n = n + it.count end end end; return n end
+local function BagTake(id, count)
+    for b = 0, 4 do for slot, it in pairs(bags[b]) do
+        if it.id == id then local take = math.min(count, it.count); it.count = it.count - take; count = count - take
+            if it.count == 0 then bags[b][slot] = nil end
+            if count == 0 then return end end
+    end end
+end
+C_Container = {
+    GetContainerNumSlots = function() return 16 end,
+    GetContainerNumFreeSlots = function(b) local used = 0; for _ in pairs(bags[b]) do used = used + 1 end; return 16 - used, 0 end,
+    GetContainerItemInfo = function(b, slot) local it = bags[b][slot]; if not it then return nil end
+        return { itemID = it.id, stackCount = it.count, quality = it.q or 1, isBound = it.bound or false, isLocked = false } end,
+    GetItemCooldown = function() return 0, 0, 1 end,
+}
+C_Item.GetItemCount = function(id, bank) return BagCount(id) + (bank and (BAGS[id] or 0) or 0) end
+ItemLocation = { CreateFromBagAndSlot = function(_, b, slot) return { bag = b, slot = slot } end }
+local combat = false
+function InCombatLockdown() return combat end
+local salvagerBuff = false
+C_UnitAuras = { GetPlayerAuraBySpellID = function(id) if id == 1283701 and salvagerBuff then return { spellId = id } end end }
+local overrides = {}
+function SetOverrideBindingClick(_, _, key, name) overrides[key] = name end
+function ClearOverrideBindings() wipe(overrides) end
+C_Spell = { GetSpellName = function(id) if id == 13262 then return "Disenchant" end end }
+local loot = {}
+function GetNumLootItems() return #loot end
+function GetLootSlotLink(i) return "|Hitem:" .. loot[i][1] .. "::|h" end
+function GetLootSlotInfo(i) return 0, "loot", loot[i][2] end
+local inbox = {}
+function GetInboxNumItems() return #inbox end
+function GetInboxHeaderInfo(i) local m = inbox[i]
+    return nil, nil, m.sender, m.subject, m.money or 0, m.cod or 0, 30, m.items or 0, false, false, false, m.canReply or false, false end
+function GetInboxInvoiceInfo(i) return inbox[i] and inbox[i].invoice end
+function AutoLootMailItem(i) Restricted("AutoLootMailItem", i) end
+function TakeInboxMoney(i) Restricted("TakeInboxMoney", i) end
+function IsShiftKeyDown() return false end
+C_TradeSkillUI.CraftRecipe = function(...) Restricted("CraftRecipe", ...) end
+C_TradeSkillUI.GetCraftableCount = function() return 0 end
+
+-- TradeSkillMaster's public API
+local tsm = {}
+TSM_API = { GetCustomPriceValue = function(source, itemString) return tsm[source] and tsm[source][itemString] end }
+local function TSM(source, id, value) tsm[source] = tsm[source] or {}; tsm[source]["i:" .. id] = value end
+
+-- the auction house
+local AHs = C_AuctionHouse
+local commodity, itemResults, sent = {}, {}, {}
+local function KS(key) return ("%d:%d:%d"):format(key.itemID, key.itemLevel or 0, key.itemSuffix or 0) end
+local throttleReady, cancelled, postConfirm, depositPer = true, 0, false, 1
+local browseList, browseFull = {}, true
+AHs.IsThrottledMessageSystemReady = function() return throttleReady end
+AHs.MakeItemKey = function(id) return { itemID = id, itemLevel = 0, itemSuffix = 0, battlePetSpeciesID = 0 } end
+AHs.SendSearchQuery = function(key) sent[#sent + 1] = { kind = "search", key = key } end
+AHs.SendBrowseQuery = function(q) sent[#sent + 1] = { kind = "browse", q = q } end
+AHs.RequestMoreBrowseResults = function() sent[#sent + 1] = { kind = "more" } end
+AHs.HasFullBrowseResults = function() return browseFull end
+AHs.GetBrowseResults = function() return browseList end
+AHs.GetNumCommoditySearchResults = function(id) return #(commodity[id] or {}) end
+AHs.GetCommoditySearchResultInfo = function(id, i) local r = commodity[id][i]
+    return { itemID = id, unitPrice = r[1], quantity = r[2], numOwnerItems = r[3] or 0, containsOwnerItem = (r[3] or 0) > 0, auctionID = i } end
+AHs.HasFullCommoditySearchResults = function() return true end
+AHs.GetNumItemSearchResults = function(key) return #(itemResults[KS(key)] or {}) end
+AHs.GetItemSearchResultInfo = function(key, i) return itemResults[KS(key)][i] end
+AHs.SupportsCopperValues = function() return true end
+AHs.PlaceBid = function(...) Restricted("PlaceBid", ...) end
+AHs.StartCommoditiesPurchase = function(...) Restricted("StartCommoditiesPurchase", ...) end
+AHs.ConfirmCommoditiesPurchase = function(...) Restricted("ConfirmCommoditiesPurchase", ...) end
+AHs.CancelCommoditiesPurchase = function() cancelled = cancelled + 1 end
+AHs.GetQuoteDurationRemaining = function() return 30 end
+AHs.PostCommodity = function(...) Restricted("PostCommodity", ...); return postConfirm end
+AHs.PostItem = function(...) Restricted("PostItem", ...); return postConfirm end
+AHs.ConfirmPostCommodity = function(...) Restricted("ConfirmPostCommodity", ...) end
+AHs.ConfirmPostItem = function(...) Restricted("ConfirmPostItem", ...) end
+local commodities = {}
+AHs.GetItemCommodityStatus = function(loc) return commodities[bags[loc.bag][loc.slot].id] and 2 or 1 end
+AHs.GetAvailablePostCount = function(loc) return BagCount(bags[loc.bag][loc.slot].id) end
+AHs.CalculateCommodityDeposit = function(_, _, qty) return depositPer * qty end
+AHs.CalculateItemDeposit = function() return 10 end
+
+-- answers the latest query the way the AH would, then lets the scanner send the next one
+local function Answer()
+    local q = sent[#sent]
+    if not q then return end
+    if q.kind == "search" then
+        local id = q.key.itemID
+        if commodity[id] then Fire("COMMODITY_SEARCH_RESULTS_UPDATED", id) else Fire("ITEM_SEARCH_RESULTS_UPDATED", q.key) end
+    else
+        Fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    end
+end
+local function Drain(max)
+    for _ = 1, max or 80 do
+        clock = clock + 1.1
+        local before = #sent
+        ns.Scanner.Pump()
+        if #sent == before then return end
+        Answer()
+    end
+end
+
+Fire("AUCTION_HOUSE_SHOW") -- installs the query hooks now that the AH API is complete
+Fire("PLAYER_LOGIN")       -- the ledger's mail hooks, now that the mail API exists
+check(violations == 0, "setup: nothing restricted called")
+
+---------------------------------------------------------------------------
+-- Prices: live > Auctionator > TSM
+---------------------------------------------------------------------------
+ns.OrderBook.Reset()
+TSM("DBMinBuyout", 4444, 180); TSM("DBMarket", 10938, 100)
+TSM("DBRegionSaleRate * 1000", 10938, 620); TSM("DBRegionSoldPerDay * 1000", 10938, 3872000)
+check(ns.Prices.Get(10938) == 100 and select(2, ns.Prices.Get(10938)) == "auctionator", "prices: Auctionator when nothing live")
+AHP[4444] = nil
+check(ns.Prices.Get(4444) == 180 and select(2, ns.Prices.Get(4444)) == "tsm", "prices: TSM min buyout when Auctionator has none")
+AHP[4444] = 200
+check(math.abs(ns.Prices.SaleRate(10938) - 0.62) < 1e-9 and math.abs(ns.Prices.SoldPerDay(10938) - 3872) < 1e-9,
+    "prices: TSM sale rate and daily sales unscaled from x1000")
+
+---------------------------------------------------------------------------
+-- Order book and scanner
+---------------------------------------------------------------------------
+commodity[10939] = { { 200, 10 } }                -- Greater Magic Essence: 10 at 2s
+commodity[10938] = { { 90, 3 }, { 100, 40 }, { 120, 60 }, { 95, 5, 5 } } -- Lesser: 3 thin at 90c, wall at 1s, 5 of ours at 95c
+commodities[10939], commodities[10938] = true, true
+local before = #sent
+ns.Scanner.Search(10939); ns.Scanner.Search(10938); ns.Scanner.Search(10939)
+check(#ns.Scanner and true, "scanner: queued")
+ns.Scanner.Pump(); ns.Scanner.Pump()
+check(#sent == before + 1, "scanner: one search at a time, duplicates merged")
+throttleReady = false; Answer(); clock = clock + 5; ns.Scanner.Pump()
+check(#sent == before + 1, "scanner: waits while the game's query throttle isn't ready")
+throttleReady = true; clock = clock + 0.5; ns.Scanner.Pump()
+check(#sent == before + 2, "scanner: sends once the throttle is ready")
+local t0 = clock; ns.Scanner.Search(2589); Answer(); ns.Scanner.Pump()
+check(#sent == before + 2 and clock == t0, "scanner: at least a second between searches (60 a minute, the game allows 100)")
+Drain()
+local lesser = ns.OrderBook.Get(10938)
+check(lesser and lesser.min == 90 and lesser.total == 103 and lesser.own == 5, "book: tiers from search results, our own listings set apart")
+check(ns.OrderBook.Wall(10938) == 100, "book: wall is the first price with 10% of the listings (thin 90c undercut ignored)")
+check(ns.OrderBook.SellPrice(10938) == 99, "book: post a copper under the wall")
+local cost, got, top = ns.OrderBook.CostFor(10938, 50, 110)
+check(cost == 3 * 90 + 40 * 100 and got == 43 and top == 100, "book: cost of 50 under 1s 10c: takes the 43 that qualify")
+cost, got = ns.OrderBook.CostFor(10938, 50, 200, nil, 1000)
+check(got == 10 and cost == 3 * 90 + 7 * 100, "book: budget-capped sweep")
+check(ns.Prices.Get(10938) == 90 and select(2, ns.Prices.Get(10938)) == "live", "prices: live search beats Auctionator")
+AHs.SupportsCopperValues = function() return false end
+check(ns.OrderBook.SellPrice(10939) == 100, "book: whole silver when the AH takes no copper (2s wall -> 1s)")
+AHs.SupportsCopperValues = function() return true end
+
+---------------------------------------------------------------------------
+-- Essences: 3 lesser <-> 1 greater
+---------------------------------------------------------------------------
+local opps = ns.Essences.Opportunities()
+local split = opps[1]
+-- buy 10 greater at 2s, sell 30 lesser at 99c: 30 x 99 x 0.95 = 28s 21.5c, minus 2s x 10 and a 30c deposit
+check(split and split.kind == "split" and split.sets == 10 and split.cost == 2000, "essences: split 10 greater (all listed)")
+check(split and math.abs(split.profit - (30 * 99 * 0.95 - 2000 - 30)) < 1e-6, "essences: profit after cut and the game's deposit")
+check(#opps == 1, "essences: combine skipped (3 lesser cost more than a greater sells for)")
+
+---------------------------------------------------------------------------
+-- Disenchant statistics and plays (Enchanting 30)
+---------------------------------------------------------------------------
+GetProfessions = function() return 1, 3, nil, nil, 2, nil end
+GetProfessionInfo = function(i) if i == 3 then return "Enchanting", 0, 30, 75, 0, 0, 333 end return professionInfo(i) end
+ns.Engine:Invalidate(); flush()
+commodity[10940] = { { 50, 200 } }; commodity[10998] = { { 400, 50 } }; commodity[10978] = { { 300, 30 } }
+for _, id in ipairs({ 10940, 10998, 10978 }) do commodities[id] = true; ns.Scanner.Search(id) end
+Drain()
+local st = ns.Disenchant.Stats(4, 2, 22)
+-- 75% 4-6 dust at 49c, 15% 1-2 lesser astral at 3s 99c, 10% a shard at 2s 99c
+local ev = 0.75 * 5 * 49 + 0.15 * 1.5 * 399 + 0.10 * 299
+local sq = 0.75 * (2 / 3 + 25) * 49 ^ 2 + 0.15 * 2.5 * 399 ^ 2 + 0.10 * 299 ^ 2
+check(st and math.abs(st.ev - ev) < 1e-6, "stats: expected mats value per green (sell prices)")
+check(st and math.abs(st.sd - math.sqrt(sq - ev * ev)) < 1e-6, "stats: standard deviation from each outcome")
+check(ns.Disenchant.Bracket(4, 2, 22) == "2:4:21-25" and ns.Disenchant.BracketLabel(4, 2, 22) == "Green armor, item level 21-25",
+    "stats: bracket key and label")
+
+GEAR[7011] = { class = 4, q = 2, ilvl = 23 }; GEAR[7012] = { class = 4, q = 2, ilvl = 24 }; GEAR[7013] = { class = 4, q = 2, ilvl = 25 }
+ITEMS[7011], ITEMS[7012], ITEMS[7013] = "Green Belt", "Green Boots", "Green Bracers"
+local function GearKey(id) return { itemID = id, itemLevel = GEAR[id].ilvl, itemSuffix = 0, battlePetSpeciesID = 0 } end
+browseList = {
+    { itemKey = GearKey(7001), minPrice = 100, totalQuantity = 1 }, { itemKey = GearKey(7011), minPrice = 110, totalQuantity = 1 },
+    { itemKey = GearKey(7012), minPrice = 120, totalQuantity = 1 }, { itemKey = GearKey(7013), minPrice = 130, totalQuantity = 1 },
+    { itemKey = GearKey(7002), minPrice = 5000, totalQuantity = 1 }, -- staff: dearer than its mats
+}
+ns.Scanner.Browse("gear", ns.Scanner.GearQuery()); Drain()
+check(sent[#sent].kind == "browse" and sent[#sent].q.filters[1] == 8, "scanner: gear browse (green and blue armor/weapons)")
+local result = ns.Plays.Build(true)
+local function FindPlay(id) for _, p in ipairs(result.plays) do if p.id == id then return p end end end
+local dePlay = FindPlay("de:2:4:21-25:false")
+local essPlay = FindPlay("ess:split:10939")
+check(essPlay and essPlay.tier == "safe" and essPlay.buys[1].want == 10, "plays: essence split is SAFE (no luck, lesser sells fast)")
+check(dePlay and dePlay.tier == "likely" and #dePlay.buys == 4, "plays: 4 greens under the max price, LIKELY")
+check(dePlay and dePlay.need <= 4, "plays: batch big enough for 95% (" .. tostring(dePlay and dePlay.need) .. " needed)")
+check(dePlay and math.abs(dePlay.profit - (4 * ev * 0.95 - 460)) < 1e-6, "plays: disenchant profit after the AH cut")
+check(not FindPlay("de:2:2:21-25:false"), "plays: the dear staff isn't offered")
+check(result.plays[1].score >= result.plays[2].score, "plays: ranked by profit per minute x certainty")
+print("\n--- plays ---"); for _, p in ipairs(result.plays) do
+    print(("%s %s  profit %s  needs %s  %s"):format(p.tier, p.title, strip(ns.Money(p.profit or 0)), strip(ns.Money(p.cost or 0)), p.locked or ""))
+    for _, x in ipairs(p.pros) do print("   + " .. x) end; for _, x in ipairs(p.cons) do print("   ! " .. strip(x)) end end
+
+-- a small batch: luck can't even out
+browseList = { browseList[1] }
+OrderBookResetBrowse = nil
+ns.OrderBook.Reset(); for _, id in ipairs({ 10939, 10938, 10940, 10998, 10978 }) do ns.Scanner.Search(id) end
+ns.Scanner.Browse("gear", ns.Scanner.GearQuery()); Drain()
+result = ns.Plays.Build(true)
+check(not FindPlay("de:2:4:21-25:false") and result.hidden >= 1, "plays: one green isn't enough for 95%: RISKY, hidden in Safe mode")
+ns.settings.risk = "aggressive"; result = ns.Plays.Build(true)
+local small = FindPlay("de:2:4:21-25:false")
+check(small and small.tier == "speculative" and has(small.cons, "needed for the luck to even out"), "plays: shown as RISKY in Aggressive mode")
+ns.settings.risk = "safe"
+
+-- not enough gold for a safe batch: locked, with the reason
+browseList = {
+    { itemKey = GearKey(7001), minPrice = 100, totalQuantity = 1 }, { itemKey = GearKey(7011), minPrice = 110, totalQuantity = 1 },
+    { itemKey = GearKey(7012), minPrice = 120, totalQuantity = 1 }, { itemKey = GearKey(7013), minPrice = 130, totalQuantity = 1 } }
+ns.Scanner.Browse("gear2", ns.Scanner.GearQuery()); Drain()
+money = 120 / 0.85 + 1 -- 1s 20c above the reserve
+result = ns.Plays.Build(true)
+local lockedDE = FindPlay("de:2:4:21-25:false")
+check(lockedDE and lockedDE.tier == "locked" and lockedDE.locked:find("chance of not losing", 1, true), "plays: locked when gold can't buy a safe batch")
+check(result.plays[#result.plays].tier == "locked", "plays: locked plays listed last")
+money = 1000000
+result = ns.Plays.Build(true)
+dePlay = FindPlay("de:2:4:21-25:false")
+essPlay = FindPlay("ess:split:10939")
+
+---------------------------------------------------------------------------
+-- Buying: one click = one purchase call, re-checked at the click
+---------------------------------------------------------------------------
+check(ns.settings.dryRun == true, "buy: dry run is on by default")
+ns.Buy.Start(dePlay)
+local action = ns.Buy.Next()
+check(action and action.kind == "wait" and action.label:find("Checking prices"), "buy: searches the listing first")
+Drain()
+itemResults[KS(GearKey(7001))] = { { auctionID = 501, buyoutAmount = 100, quantity = 1, containsOwnerItem = false, itemLink = "[Green Gloves]" } }
+itemResults[KS(GearKey(7011))] = { { auctionID = 502, buyoutAmount = 110, quantity = 1, containsOwnerItem = false, itemLink = "[Green Belt]" } }
+itemResults[KS(GearKey(7012))] = { { auctionID = 503, buyoutAmount = 999, quantity = 1, containsOwnerItem = false, itemLink = "[Green Boots]" } }
+itemResults[KS(GearKey(7013))] = { { auctionID = 504, buyoutAmount = 130, quantity = 1, containsOwnerItem = true, itemLink = "[Green Bracers]" } }
+ns.Buy.Stop(); ns.Buy.Start(dePlay); ns.Buy.Next(); Drain()
+action = ns.Buy.Next()
+check(action and action.kind == "item" and action.auction.auctionID == 501, "buy: cheapest listing under the max offered: " .. strip(action and action.label or ""))
+Press(ns.Buy.Click, action)
+check(Calls("PlaceBid") == 0 and ns.Buy.Message():find("Dry run"), "buy: dry run spends nothing")
+check((ns.char.deQueue[7001] or 0) == 0, "buy: dry run queues nothing to disenchant")
+
+ns.settings.dryRun = false
+ns.Buy.Stop(); ns.Buy.Start(dePlay); ns.Buy.Next(); Drain()
+action = ns.Buy.Next()
+itemResults[KS(GearKey(7001))][1].buyoutAmount = 150 -- someone relisted it dearer between the search and the click
+Press(ns.Buy.Click, action)
+check(Calls("PlaceBid") == 0 and ns.Buy.Message():find("sold or changed"), "buy: listing changed since the search: nothing bought")
+itemResults[KS(GearKey(7001))][1].buyoutAmount = 100
+ns.Buy.Stop(); ns.Buy.Start(dePlay); ns.Buy.Next(); Drain()
+action = ns.Buy.Next()
+Press(ns.Buy.Click, action)
+check(Calls("PlaceBid") == 1 and LastArgs("PlaceBid")[1] == 501 and LastArgs("PlaceBid")[2] == 100, "buy: one click, one PlaceBid at the listed buyout")
+check(ns.Buy.Next().kind == "wait", "buy: next press waits until the AH answers")
+Press(ns.Buy.Click, ns.Buy.Next())
+check(Calls("PlaceBid") == 1, "buy: pressing again while waiting does nothing")
+Fire("AUCTION_HOUSE_PURCHASE_COMPLETED", 501)
+check(ns.char.deQueue[7001] == 1, "buy: bought green queued for the Disenchant button")
+check(ns.db.ledger[#ns.db.ledger].kind == "buy" and ns.db.ledger[#ns.db.ledger].money == 100, "buy: purchase in the ledger")
+ns.Buy.Next(); Drain()
+action = ns.Buy.Next()
+check(action and action.kind == "item" and action.auction.auctionID == 502, "buy: next listing after the purchase")
+Press(ns.Buy.Click, action); Fire("AUCTION_HOUSE_PURCHASE_COMPLETED", 502)
+for _ = 1, 4 do ns.Buy.Next(); Drain() end
+action = ns.Buy.Next()
+check(action == nil or action.kind ~= "item" or (action.auction.auctionID ~= 503 and action.auction.auctionID ~= 504),
+    "buy: never over the max price, never our own listing")
+check(Calls("PlaceBid") == 2, "buy: exactly two purchases for two clicks")
+ns.Buy.Stop()
+
+-- commodities: quote, then confirm; a dearer quote is cancelled
+ns.Buy.Start(essPlay); ns.Buy.Next(); Drain()
+action = ns.Buy.Next()
+check(action and action.kind == "commodity" and action.qty == 10 and action.total == 2000, "buy: 10 greater essences for 20s")
+Press(ns.Buy.Click, action)
+check(Calls("StartCommoditiesPurchase") == 1 and LastArgs("StartCommoditiesPurchase")[2] == 10, "buy: first click asks for a quote")
+Fire("COMMODITY_PRICE_UPDATED", 260, 2600)
+check(cancelled == 1 and ns.Buy.State() == "idle" and ns.Buy.Message():find("went up"), "buy: quote over the maximum is cancelled")
+ns.Buy.Next(); Drain(); action = ns.Buy.Next()
+Press(ns.Buy.Click, action)
+Fire("COMMODITY_PRICE_UPDATED", 200, 2000)
+action = ns.Buy.Next()
+check(action.kind == "confirm" and Calls("ConfirmCommoditiesPurchase") == 0, "buy: good quote waits for a second click")
+Press(ns.Buy.Click, action)
+check(Calls("ConfirmCommoditiesPurchase") == 1, "buy: second click confirms")
+check(ns.Buy.Stop() == false and ns.Buy.Active(), "buy: can't stop a play while its purchase is in flight")
+Fire("COMMODITY_PURCHASE_SUCCEEDED")
+check(ns.char.convert[10939] == 10 and ns.char.toSell[10938], "buy: 10 splits queued and the lesser essences marked for posting")
+ns.Buy.Stop()
+
+-- a quote whose total grew is refused even if the average is under the maximum
+commodity[10939] = { { 200, 20 } }
+ns.Buy.Start(essPlay); ns.Buy.Next(); Drain(); action = ns.Buy.Next()
+Press(ns.Buy.Click, action)
+Fire("COMMODITY_PRICE_UPDATED", 199, 2010) -- 1c more than planned in total: some units are dearer
+check(ns.Buy.State() == "idle" and Calls("ConfirmCommoditiesPurchase") == 1, "buy: quote above the planned total is cancelled")
+-- dry run switched on while a quote waits: the confirming press buys nothing
+ns.Buy.Next(); Drain(); action = ns.Buy.Next()
+Press(ns.Buy.Click, action)
+Fire("COMMODITY_PRICE_UPDATED", 200, 2000)
+ns.settings.dryRun = true
+Press(ns.Buy.Click, ns.Buy.Next())
+check(Calls("ConfirmCommoditiesPurchase") == 1 and ns.Buy.Message():find("Dry run"), "buy: dry run turned on mid-quote: nothing bought")
+ns.settings.dryRun = false
+-- a purchase the AH answers late is still counted
+ns.Buy.Next(); Drain(); action = ns.Buy.Next()
+Press(ns.Buy.Click, action); Fire("COMMODITY_PRICE_UPDATED", 200, 2000); Press(ns.Buy.Click, ns.Buy.Next())
+local spentBefore = ns.Ledger.SessionSpent()
+clock = clock + 40; ns.Buy.Tick()
+check(ns.Buy.State() == "idle", "buy: gives up waiting after 30s")
+Fire("COMMODITY_PURCHASE_SUCCEEDED")
+check(ns.Ledger.SessionSpent() == spentBefore + 2000, "buy: late success still counted against the session cap")
+ns.Buy.Stop()
+commodity[10939] = { { 200, 10 } }
+check(violations == 0, "buy: no purchase call outside a press")
+
+-- budget: never past the session cap
+ns.settings.sessionCap = 2100 -- 21s, of which 23s 10c already spent this session
+check(ns.Profile.Budget() == 0, "budget: session cap reached, nothing more to spend")
+ns.settings.sessionCap = 500000
+
+---------------------------------------------------------------------------
+-- The Work button: mail, convert, disenchant (with the Salvager lock)
+---------------------------------------------------------------------------
+local work = ns.Work.button
+local function WorkPress() Press(work.scripts.PreClick, work, "LeftButton"); clock = clock + 1 end
+check(work and work.attrs and work.attrs.useOnKeyDown == false, "work: acts on release only (one press = one action)")
+inbox = { { sender = "Alliance Auction House", subject = "Auction won: Greater Magic Essence", items = 1, invoice = "buyer" },
+    { sender = "Friend", subject = "hi", items = 1, canReply = true } }
+Fire("MAIL_SHOW")
+local step = ns.Work.NextStep()
+check(step and step.kind == "mail" and step.label:find("1 left"), "work: takes auction house mail only")
+WorkPress()
+check(Calls("AutoLootMailItem") == 1 and LastArgs("AutoLootMailItem")[1] == 1, "work: one press takes one mail")
+WorkPress()
+check(Calls("AutoLootMailItem") == 1, "work: no second take until the inbox updates")
+Fire("MAIL_INBOX_UPDATE")
+inbox = {}; Fire("MAIL_CLOSED")
+BagPut(10939, 10)
+step = ns.Work.NextStep()
+check(step.kind == "convert" and step.label:find("Split"), "work: split the bought greater essences")
+WorkPress()
+check(work.attrs.type1 == "macro" and work.attrs.macrotext1 == "/use item:10939", "work: the press uses one essence")
+local convertsBefore = ns.char.convert[10939]
+BagTake(10939, 1); BagPut(10938, 3); Fire("BAG_UPDATE_DELAYED")
+check(ns.char.convert[10939] == convertsBefore - 1, "work: one conversion counted")
+ns.char.convert[10939] = nil; BagTake(10939, 9)
+
+local glovesBag, glovesSlot = BagPut(7001, 1, { q = 2 }); BagPut(7011, 1, { q = 2 }); BagPut(7012, 1, { q = 2, bound = true })
+ns.char.deQueue[7012] = 1
+step = ns.Work.NextStep()
+check(step.kind == "disenchant" and step.itemID == 7001, "work: disenchants a bought green")
+WorkPress()
+check(work.attrs.macrotext1 == ("/cast Disenchant\n/use %d %d"):format(glovesBag, glovesSlot), "work: /cast Disenchant on that bag slot")
+Press(work.scripts.PostClick, work)
+check(work.attrs.macrotext1 == nil and work.attrs.type1 == nil, "work: cleared after the press, so nothing stale can fire later")
+local preDE = work.attrs.macrotext1
+WorkPress() -- still casting: nothing new
+Fire("UNIT_SPELLCAST_START", "player", "guid", 13262)
+WorkPress()
+check(work.attrs.type1 == nil, "work: presses during the cast do nothing")
+Fire("UNIT_SPELLCAST_SUCCEEDED", "player", "guid", 13262)
+loot = { { 10940, 5 } }; Fire("LOOT_READY"); loot = {}
+BagTake(7001, 1); BagPut(10940, 5)
+check(ns.char.deQueue[7001] == nil and ns.char.toSell[10940], "work: disenchanted item off the list, its dust marked for posting")
+check(ns.Telemetry.Count("2:4:21-25", false) == 1, "telemetry: result recorded without the Salvager")
+ns.char.salvager[7011] = true
+clock = clock + 5
+step = ns.Work.NextStep()
+check(step.kind == "locked" and step.warn and step.label:find("Salvager buff missing"), "work: Salvager buys wait for the buff")
+salvagerBuff = true
+step = ns.Work.NextStep()
+check(step.kind == "disenchant" and step.itemID == 7011, "work: buff on: disenchants")
+check(not (step.itemID == 7012), "work: never soulbound gear")
+WorkPress(); Fire("UNIT_SPELLCAST_SUCCEEDED", "player", "guid", 13262); loot = { { 10940, 6 } }; Fire("LOOT_READY"); loot = {}
+check(ns.Telemetry.Count("2:4:21-25", true) == 1, "telemetry: buffed result kept apart")
+salvagerBuff = false
+Press(work.scripts.PostClick, work) -- the game runs PostClick after every press
+combat = true
+local beforeCombat = #restricted
+WorkPress()
+check(work.attrs.type1 == nil and #restricted == beforeCombat and ns.Work.NextStep().label == "In combat", "work: nothing in combat")
+combat = false
+
+-- scroll-down only when you ask for it, only over the button
+work.scripts.OnEnter(work)
+check(next(overrides) == nil, "wheel: off by default, zoom untouched")
+ns.settings.wheel = true
+work.scripts.OnEnter(work)
+check(overrides.MOUSEWHEELDOWN == "ProfitCraftWorkKey" and overrides.MOUSEWHEELUP == nil, "wheel: scroll-down over the button presses its key twin")
+local keyTwin = ns.Work.keyButton
+check(keyTwin and keyTwin.attrs.useOnKeyDown == true and keyTwin.scripts.PreClick == work.scripts.PreClick,
+    "wheel/keys: the twin acts on key-down with the same press logic")
+combat = true; work.scripts.OnLeave(work); combat = false
+check(overrides.MOUSEWHEELDOWN ~= nil, "wheel: can't be cleared in combat...")
+Fire("PLAYER_REGEN_ENABLED")
+check(next(overrides) == nil, "wheel: ...so it's cleared as soon as combat ends")
+work.scripts.OnEnter(work)
+work.scripts.OnLeave(work)
+check(next(overrides) == nil, "wheel: leaving the button gives zoom back")
+combat = true; work.scripts.OnEnter(work); combat = false
+check(next(overrides) == nil, "wheel: never set in combat")
+ns.settings.wheel = false
+
+---------------------------------------------------------------------------
+-- Telemetry: measured rates and the Salvager bonus
+---------------------------------------------------------------------------
+check(select(3, ns.Telemetry.SalvagerMultiplier()) == "none" and ns.Telemetry.SalvagerMultiplier() == 1, "salvager: no bonus counted until measured")
+ns.settings.salvagerBonus = 20
+check(math.abs(ns.Telemetry.SalvagerMultiplier() - 1.2) < 1e-9, "salvager: your setting until measured")
+for _ = 1, 49 do ns.Telemetry.Record("2:4:21-25", true, { [10940] = 6 }) end
+local mult, n, source = ns.Telemetry.SalvagerMultiplier()
+-- table: 75% x 5 dust + 15% x 1.5 essences = 3.975 per disenchant; measured 6
+check(source == "measured" and n == 50 and math.abs(mult - 6 / 3.975) < 1e-9, ("salvager: measured x%.2f from 50 buffed disenchants"):format(mult))
+ns.settings.salvagerBonus = 0
+for _ = 1, 40 do ns.Telemetry.Record("3:0:5-20", false, { [10940] = 2, [10978] = 1 }) end
+local vest = ns.Disenchant.Evaluate(7005)
+check(not vest.unknown and vest.measured == 40 and vest.mats[1].avg == 2, "telemetry: 40 results fill in Forever's unknown blue bracket")
+
+---------------------------------------------------------------------------
+-- Posting: at the wall, never under the floor, one click each
+---------------------------------------------------------------------------
+BagClear(); BagPut(10938, 30); ns.char.toSell = { [10938] = true }
+ns.OrderBook.Reset(); ns.Scanner.Search(10938); Drain()
+local post = ns.Post.Next()
+check(post and post.kind == "post" and post.qty == 30 and post.price == 99 and post.deposit == 30, "post: 30 lesser at 99c (deposit 30c)")
+Press(ns.Post.Click, post)
+check(Calls("PostCommodity") == 1 and LastArgs("PostCommodity")[3] == 30 and LastArgs("PostCommodity")[4] == 99, "post: one click, one PostCommodity")
+Fire("AUCTION_HOUSE_AUCTION_CREATED", 9001)
+check(ns.db.ledger[#ns.db.ledger].kind == "post", "post: in the ledger")
+TSM("DBMarket", 10938, 1000) -- usually 10s: 99c is under the 60% floor
+ns.OrderBook.Reset(); ns.Scanner.Search(10938); Drain()
+post = ns.Post.Next()
+check(post == nil and ns.Post.Held()[10938] and ns.Post.Held()[10938]:find("floor"), "post: held when the going price is under the floor")
+TSM("DBMarket", 10938, 100)
+Fire("AUCTION_HOUSE_CLOSED"); Fire("AUCTION_HOUSE_SHOW")
+postConfirm = true
+ns.Scanner.Search(10938); Drain()
+post = ns.Post.Next()
+Press(ns.Post.Click, post)
+local confirm = ns.Post.Next()
+check(confirm.kind == "confirmPost" and Calls("ConfirmPostCommodity") == 0, "post: the AH asked for confirmation: waits for the next click")
+Press(ns.Post.Click, confirm)
+check(Calls("ConfirmPostCommodity") == 1, "post: second click confirms")
+postConfirm = false
+Fire("AUCTION_HOUSE_AUCTION_CREATED", 9002)
+
+---------------------------------------------------------------------------
+-- Ledger, clock, Plays tab, slash
+---------------------------------------------------------------------------
+inbox = { { sender = "Alliance Auction House", subject = "Auction successful: Lesser Magic Essence", money = 2800, invoice = "seller" } }
+Press(TakeInboxMoney, 1)
+local sum = ns.Ledger.Summary(7)
+check(sum.sold == 2800 and sum.sales == 1 and sum.buys == 22 and sum.spent == ns.Ledger.SessionSpent() and sum.spent == 4210,
+    "ledger: bought 22 for 42s 10c, sold 28s")
+inbox = {}
+
+local day, base = 86400, os.time({ year = 2026, month = 11, day = 9, hour = 0 }) -- a week with no clock change
+for d = 0, 7 do for h = 0, 21, 3 do ns.Clock.Record(10939, (h >= 18) and 300 or 200, base + d * day + h * 3600) end end
+local phase = ns.Clock.Phase(10939, 150)
+check(phase and phase.tag == "low" and (phase.sellAt:find("18%-21") or phase.sellAt:find("21%-24")),
+    "clock: a week of prices says now is cheap and evenings sell highest (" .. tostring(phase and phase.sellAt) .. ")")
+
+BagClear()
+ns.OrderBook.Reset()
+for _, id in ipairs({ 10939, 10938, 10940, 10998, 10978 }) do ns.Scanner.Search(id) end
+browseList = { { itemKey = GearKey(7001), minPrice = 100, totalQuantity = 1 }, { itemKey = GearKey(7011), minPrice = 110, totalQuantity = 1 },
+    { itemKey = GearKey(7012), minPrice = 120, totalQuantity = 1 }, { itemKey = GearKey(7013), minPrice = 130, totalQuantity = 1 } }
+ns.Scanner.Browse("gear", ns.Scanner.GearQuery()); Drain()
+flush()
+check(ns.PlaysTab.tabCreated and libtab.internalState.usedIDs.ProfitCraftPlays.text == "Plays", "Plays tab created through LibAHTab")
+libtab:SetSelected("ProfitCraftPlays")
+local tab = ns.PlaysTab.panel
+check(tab.shown and ns.PlaysTab.rows[1].play ~= nil, "Plays tab: ranked plays listed")
+print("\n--- Plays tab ---"); for i, row in ipairs(ns.PlaysTab.rows) do if row.play then print(i .. ". " .. strip(row.tier.text) .. "  " .. row.title.text .. "  " .. strip(row.info.text)) end end
+print(strip(tab.detail.body.text or ""))
+check(tab.detail.start.text == "Start this play", "Plays tab: start button (dry run off)")
+local scanAction = ns.PlaysTab.CurrentAction()
+check(scanAction.kind == "scan", "Plays tab: step button offers a scan with nothing started")
+ns.PlaysTab.Select("ess:split:10939")
+ns.settings.dryRun = true
+tab.detail.start.scripts.OnClick(tab.detail.start)
+ns.PlaysTab.Refresh()
+check(ns.Buy.Active() and ns.Buy.Active().id == "ess:split:10939", "Plays tab: Start runs the selected play")
+Drain()
+local stepAction = ns.PlaysTab.CurrentAction()
+check(stepAction.kind == "commodity", "Plays tab: step button offers the purchase: " .. strip(stepAction.label))
+local startsBefore = Calls("StartCommoditiesPurchase")
+ns.PlaysTab.Refresh()
+local shown = tab.action.text
+money = 1177 -- the budget drops to 10s without the tab repainting: the offer is now 5, not 10
+local msgBefore = ns.Buy.Message()
+Press(ns.PlaysTab.Press, "LeftButton")
+check(ns.Buy.Message() == msgBefore and tab.action.text ~= shown and tab.action.text:find("Buy 5", 1, true),
+    "Plays tab: a press only does what the button showed (offer changed: it repainted instead)")
+money = 1000000; ns.PlaysTab.Refresh()
+combat = true; Press(ns.PlaysTab.Press, "LeftButton"); combat = false
+check(ns.Buy.Message() == msgBefore, "Plays tab: nothing in combat")
+check(tab.key and tab.key.name == "ProfitCraftAHKey", "Plays tab: key twin for bindings and the wheel")
+Press(tab.key.scripts.OnClick, tab.key)
+check(Calls("StartCommoditiesPurchase") == startsBefore and (ns.Buy.Message() or ""):find("Dry run"), "Plays tab: key press (dry run) rehearses")
+local ahButton = tab.action
+ns.settings.wheel = true
+ahButton.scripts.OnEnter(ahButton)
+check(overrides.MOUSEWHEELDOWN == "ProfitCraftAHKey", "wheel: scroll-down over the AH step button presses its key twin")
+ahButton.scripts.OnLeave(ahButton)
+check(next(overrides) == nil, "wheel: zoom back when leaving it")
+ns.settings.wheel = false
+ns.Buy.Stop()
+
+-- crafting for disenchanting: the crafted items join the Disenchant button's list
+ns.char.craft = { recipeID = 300, count = 2, disenchant = true }
+ProfessionsFrame.shown = true
+C_TradeSkillUI.GetCraftableCount = function(rid) return rid == 300 and 5 or 0 end
+local craftStep = ns.Work.NextStep()
+check(craftStep and craftStep.kind == "craft" and craftStep.count == 2, "work: craft the play's 2 gloves")
+local queuedBefore = ns.char.deQueue[7001] or 0
+WorkPress()
+check(Calls("CraftRecipe") == 1 and LastArgs("CraftRecipe")[1] == 300 and LastArgs("CraftRecipe")[2] == 2, "work: one press, one craft call")
+WorkPress()
+check(Calls("CraftRecipe") == 1 and ns.Work.NextStep().kind == "wait", "work: pressing again while crafting does nothing")
+check((ns.char.deQueue[7001] or 0) == queuedBefore, "work: nothing counted before a craft finishes")
+Fire("UNIT_SPELLCAST_SUCCEEDED", "player", "g", 300); Fire("UNIT_SPELLCAST_SUCCEEDED", "player", "g", 300)
+check(ns.char.deQueue[7001] == queuedBefore + 2 and ns.char.craft == nil, "work: each finished craft queued for disenchanting")
+C_TradeSkillUI.GetCraftableCount = function() return 0 end
+
+capture(); SlashCmdList.PROFITCRAFT("plays"); SlashCmdList.PROFITCRAFT("ledger"); SlashCmdList.PROFITCRAFT("de")
+SlashCmdList.PROFITCRAFT("dryrun"); SlashCmdList.PROFITCRAFT("dryrun"); SlashCmdList.PROFITCRAFT("selling"); SlashCmdList.PROFITCRAFT("status")
+SlashCmdList.PROFITCRAFT("wheel"); local wheelOn = ns.settings.wheel; SlashCmdList.PROFITCRAFT("wheel")
+print = realPrint
+print("\n--- /craftprofit plays, ledger, de, status ---"); for _, l in ipairs(printed) do print(strip(l)) end
+check(has(printed, "Top plays:") and has(printed, "Last 7 days") and has(printed, "Arcane Salvager: x1.51"), "slash: plays, ledger, de")
+check(has(printed, "TradeSkillMaster data: found"), "status: TSM found")
+check(wheelOn == true and ns.settings.wheel == false, "/craftprofit wheel toggles scroll-down")
+check(ns.Options.tradingPage ~= nil, "options: Buying & selling page built")
+check(violations == 0, "no purchase, post, cast or mail call ever ran outside a press")
+check(#ns.db.errors == 0, "no errors recorded in the trading tests" .. (ns.db.errors[1] and (": " .. ns.db.errors[1].where .. " " .. ns.db.errors[1].err) or ""))
 
 print(("\n%d failure(s)"):format(failures))
 os.exit(failures == 0 and 0 or 1)
