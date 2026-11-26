@@ -1,14 +1,15 @@
 ## Interface: 16001
 ## Title: ProfitCraft
-## Notes: Glows your most profitable crafts (gold, silver, bronze) in the profession window, at trainers, in What's Training's recipe list and on AH recipes, using Auctionator prices. Adds a Profit tab to the AH that builds shopping lists. Enchanters also see what crafts are worth disenchanted.
-## Version: 1.4.0
-## OptionalDeps: Auctionator, WhatsTraining
+## Notes: Finds the most profitable things to buy, craft, disenchant and sell, and walks you through them one press at a time. Glows your best crafts in the profession window, at trainers, in What's Training and on AH recipes; adds Profit and Plays tabs to the AH. Prices from Auctionator, sale rates from TradeSkillMaster.
+## Version: 2.0.0
+## OptionalDeps: Auctionator, TradeSkillMaster, WhatsTraining
 ## SavedVariables: ProfitCraftDB
 ## SavedVariablesPerCharacter: ProfitCraftCharDB
 ## IconTexture: Interface\Icons\INV_Misc_Coin_02
 
 Core.lua
 Data.lua
+Prices.lua
 Disenchant.lua
 Engine.lua
 Display.lua
@@ -16,6 +17,19 @@ Professions.lua
 Trainer.lua
 WhatsTraining.lua
 RecipeItems.lua
+Profile.lua
+OrderBook.lua
+Scanner.lua
+Telemetry.lua
+Clock.lua
+Ledger.lua
+Essences.lua
+Plays.lua
+Buy.lua
+Post.lua
+Work.lua
 AuctionHouse.lua
+PlaysTab.lua
 Options.lua
 Slash.lua
+Bindings.lua

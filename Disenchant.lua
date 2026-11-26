@@ -28,6 +28,14 @@ local SMALL_RADIANT, LARGE_RADIANT = 11177, 11178
 local SMALL_BRILLIANT, LARGE_BRILLIANT = 14343, 14344
 local NEXUS = 20725
 
+-- Every mat disenchanting can give (what the Plays tab scans).
+Disenchant.MAT_IDS = { STRANGE, SOUL, VISION, DREAM, ILLUSION, LESSER_MAGIC, GREATER_MAGIC, LESSER_ASTRAL, GREATER_ASTRAL,
+    LESSER_MYSTIC, GREATER_MYSTIC, LESSER_NETHER, GREATER_NETHER, LESSER_ETERNAL, GREATER_ETERNAL, SMALL_GLIMMERING,
+    LARGE_GLIMMERING, SMALL_GLOWING, LARGE_GLOWING, SMALL_RADIANT, LARGE_RADIANT, SMALL_BRILLIANT, LARGE_BRILLIANT, NEXUS }
+local SHARDS = { [SMALL_GLIMMERING] = true, [LARGE_GLIMMERING] = true, [SMALL_GLOWING] = true, [LARGE_GLOWING] = true,
+    [SMALL_RADIANT] = true, [LARGE_RADIANT] = true, [SMALL_BRILLIANT] = true, [LARGE_BRILLIANT] = true, [NEXUS] = true }
+function Disenchant.IsShard(itemID) return SHARDS[itemID] == true end
+
 local MIN_LEVEL = { [2] = 5, [3] = 5, [4] = 40 } -- lowest item level that can be disenchanted, by quality
 local MAX_LEVEL = 99
 
@@ -72,8 +80,8 @@ local UNCOMMON_Q, RARE_Q, EPIC_Q = 2, 3, 4
 local WEAPON, ARMOR = 2, 4 -- item class IDs
 
 local function Band(tbl, itemLevel)
-    for _, row in ipairs(tbl) do
-        if itemLevel <= row[1] then return row end
+    for i, row in ipairs(tbl) do
+        if itemLevel <= row[1] then return row, i end
     end
 end
 
@@ -112,10 +120,80 @@ local function ItemInfo(itemID)
     if C_Item and C_Item.RequestLoadItemDataByID then C_Item.RequestLoadItemDataByID(itemID) end
 end
 
-local function Mat(spec, chance)
+local function Mat(spec, chance, price)
     if not spec or chance <= 0 then return nil end
     local item, min, max = spec[1], spec[2], spec[3]
-    return { item = item, min = min, max = max, chance = chance, avg = chance * (min + max) / 2, unit = ns.AHPrice(item) }
+    return { item = item, min = min, max = max, chance = chance, avg = chance * (min + max) / 2,
+        unit = (price or ns.AHPrice)(item) }
+end
+
+-- Reads an item's class, quality and item level (nil while the game is still loading it).
+function Disenchant.ItemSpec(itemID)
+    if not itemID then return nil end
+    local _, _, _, _, _, classID = ns.ItemInstant(itemID)
+    if classID ~= ARMOR and classID ~= WEAPON then return nil end
+    local quality, itemLevel = ItemInfo(itemID)
+    if not quality then return nil end
+    return classID, quality, itemLevel
+end
+
+function Disenchant.CanDisenchant(classID, quality, itemLevel)
+    if classID ~= ARMOR and classID ~= WEAPON then return false end
+    if not quality or not MIN_LEVEL[quality] or not itemLevel then return false end
+    return itemLevel >= MIN_LEVEL[quality] and itemLevel <= MAX_LEVEL
+end
+
+-- The table bracket an item falls in: a key for the measurements, and its item level range.
+function Disenchant.Bracket(classID, quality, itemLevel)
+    if not Disenchant.CanDisenchant(classID, quality, itemLevel) then return nil end
+    local tbl = quality == UNCOMMON_Q and UNCOMMON or quality == RARE_Q and RARE or EPIC
+    local row, i = Band(tbl, itemLevel)
+    local low = i > 1 and tbl[i - 1][1] + 1 or MIN_LEVEL[quality]
+    local high = row[1] == math.huge and MAX_LEVEL or row[1]
+    local key = ("%d:%d:%d-%d"):format(quality, quality == UNCOMMON_Q and classID or 0, low, high)
+    return key, low, high
+end
+
+local QUALITY_NAME = { [UNCOMMON_Q] = "Green", [RARE_Q] = "Blue", [EPIC_Q] = "Purple" }
+function Disenchant.BracketLabel(classID, quality, itemLevel)
+    local key, low, high = Disenchant.Bracket(classID, quality, itemLevel)
+    if not key then return nil end
+    local what = quality == UNCOMMON_Q and (classID == WEAPON and " weapons" or " armor") or " gear"
+    return ("%s%s, item level %d-%d"):format(QUALITY_NAME[quality], what, low, high)
+end
+
+-- What an item of this class/quality/level disenchants into, per the tables (Classic rates; see the top).
+-- price(itemID) values each mat (default: its AH price). Returns mats, or nil + "unknown" for Forever's new
+-- blue bracket. Measurements from your own disenchants fill that bracket in once there are enough (Telemetry.lua).
+function Disenchant.TableMats(classID, quality, itemLevel, price)
+    local mats = {}
+    if quality == UNCOMMON_Q then
+        local row = Band(UNCOMMON, itemLevel)
+        local dust, essence, shard = row[5][1], row[5][2], row[5][3]
+        if classID == WEAPON then dust, essence = essence, dust end
+        mats[#mats + 1] = Mat(row[2], dust, price)
+        mats[#mats + 1] = Mat(row[3], essence, price)
+        mats[#mats + 1] = Mat(row[4], shard, price)
+        table.sort(mats, function(a, b) return a.chance > b.chance end)
+    else
+        local row = Band(quality == RARE_Q and RARE or EPIC, itemLevel)
+        if not row[2] then return nil, "unknown" end
+        mats[1] = Mat(row[2], 1, price)
+    end
+    return mats
+end
+
+-- Mats measured from your own disenchants of this bracket, averaged, when there are enough of them.
+local function MeasuredMats(classID, quality, itemLevel, price)
+    local stats = ns.Telemetry and ns.Telemetry.Measured(Disenchant.Bracket(classID, quality, itemLevel), false)
+    if not stats then return nil end
+    local mats = {}
+    for item, m in pairs(stats.mats) do
+        mats[#mats + 1] = { item = item, min = m.min, max = m.max, chance = m.hits / stats.n, avg = m.total / stats.n,
+            unit = (price or ns.AHPrice)(item) }
+    end
+    table.sort(mats, function(a, b) return a.chance > b.chance end)
+    return mats, stats.n
 end
 
 -- Expected disenchant result for one `itemID`, or nil if it can't be disenchanted (or isn't loaded yet).
@@ -123,27 +201,15 @@ end
 --   mats     { item, min, max, chance, avg (expected count), unit (AH price, nil = no price) }
 --   each     expected AH value of the mats from one item, before the AH cut (nil when a mat has no price)
 --   unknown  true for a bracket whose mats nobody knows yet (mats empty, each nil)
+--   measured number of your own disenchants the mats come from (for a bracket the tables don't cover)
 function Disenchant.Evaluate(itemID)
-    if not itemID then return nil end
-    local _, _, _, _, _, classID = ns.ItemInstant(itemID)
-    if classID ~= ARMOR and classID ~= WEAPON then return nil end
-    local quality, itemLevel = ItemInfo(itemID)
-    if not quality or not MIN_LEVEL[quality] then return nil end
-    if itemLevel < MIN_LEVEL[quality] or itemLevel > MAX_LEVEL then return nil end
+    local classID, quality, itemLevel = Disenchant.ItemSpec(itemID)
+    if not Disenchant.CanDisenchant(classID, quality, itemLevel) then return nil end
 
-    local mats = {}
-    if quality == UNCOMMON_Q then
-        local row = Band(UNCOMMON, itemLevel)
-        local dust, essence, shard = row[5][1], row[5][2], row[5][3]
-        if classID == WEAPON then dust, essence = essence, dust end
-        mats[#mats + 1] = Mat(row[2], dust)
-        mats[#mats + 1] = Mat(row[3], essence)
-        mats[#mats + 1] = Mat(row[4], shard)
-        table.sort(mats, function(a, b) return a.chance > b.chance end)
-    else
-        local row = Band(quality == RARE_Q and RARE or EPIC, itemLevel)
-        if not row[2] then return { mats = mats, unknown = true, quality = quality, itemLevel = itemLevel } end
-        mats[1] = Mat(row[2], 1)
+    local mats, measured = Disenchant.TableMats(classID, quality, itemLevel)
+    if not mats then
+        mats, measured = MeasuredMats(classID, quality, itemLevel)
+        if not mats then return { mats = {}, unknown = true, quality = quality, itemLevel = itemLevel } end
     end
 
     local each = 0
@@ -151,7 +217,73 @@ function Disenchant.Evaluate(itemID)
         if not m.unit then each = nil; break end
         each = each + m.avg * m.unit
     end
-    return { mats = mats, each = each, quality = quality, itemLevel = itemLevel }
+    return { mats = mats, each = each, quality = quality, itemLevel = itemLevel, measured = measured }
+end
+
+---------------------------------------------------------------------------
+-- For buying gear to disenchant: the spread of outcomes, not just the average
+---------------------------------------------------------------------------
+-- What a mat is worth to sell: the live wall price, and for essences the better of the two forms
+-- (3 lesser and 1 greater convert into each other from the bags).
+function Disenchant.MatValue(itemID)
+    if ns.Essences then
+        local best = ns.Essences.BestValue(itemID)
+        if best then return best end
+    end
+    return (ns.Prices.SellPrice(itemID))
+end
+
+-- E[q] and E[q^2] of a whole number drawn evenly from min..max.
+local function Moments(min, max)
+    local mean = (min + max) / 2
+    local n = max - min + 1
+    return mean, (n * n - 1) / 12 + mean * mean
+end
+
+-- Per item of this class/quality/level, valued at what the mats sell for:
+--   ev       expected mats value before the AH cut
+--   sd       its standard deviation (how much one item's result swings)
+--   mats     as in Evaluate, unit = sell value
+--   source   "table" or "measured" (n = how many of your disenchants)
+--   missing  true when a mat has no price (ev nil)
+-- opts.salvager: count the Arcane Salvager bonus on dust and essences (Telemetry.SalvagerMultiplier).
+function Disenchant.Stats(classID, quality, itemLevel, opts)
+    if not Disenchant.CanDisenchant(classID, quality, itemLevel) then return nil end
+    opts = opts or {}
+    local mult = 1
+    if opts.salvager then mult = ns.Telemetry and ns.Telemetry.SalvagerMultiplier() or 1 end
+    local key = Disenchant.Bracket(classID, quality, itemLevel)
+
+    -- your own measurements, when there are enough, replace the table (they are what this server gives)
+    local measured = ns.Telemetry and ns.Telemetry.Measured(key, opts.salvager and mult > 1)
+    if measured then
+        local mean, sq, missing = 0, 0, false
+        for _, sample in ipairs(measured.samples) do
+            local v = 0
+            for item, qty in pairs(sample) do
+                local unit = Disenchant.MatValue(item)
+                if not unit then missing = true else v = v + qty * unit end
+            end
+            mean, sq = mean + v, sq + v * v
+        end
+        local n = #measured.samples
+        if not missing and n > 0 then
+            mean, sq = mean / n, sq / n
+            return { ev = mean, sd = math.sqrt(math.max(0, sq - mean * mean)), source = "measured", n = n, mats = {} }
+        end
+    end
+
+    local mats, unknown = Disenchant.TableMats(classID, quality, itemLevel, Disenchant.MatValue)
+    if not mats then return { unknown = true } end
+    local ev, sq = 0, 0
+    for _, m in ipairs(mats) do
+        if not m.unit then return { missing = true, mats = mats } end
+        local k = Disenchant.IsShard(m.item) and 1 or mult
+        local e1, e2 = Moments(m.min, m.max)
+        ev = ev + m.chance * e1 * k * m.unit
+        sq = sq + m.chance * e2 * k * k * m.unit * m.unit
+    end
+    return { ev = ev, sd = math.sqrt(math.max(0, sq - ev * ev)), source = "table", mats = mats, multiplier = mult }
 end
 
 ---------------------------------------------------------------------------
